@@ -1,0 +1,9 @@
+   .env
+   *.db
+   *.db-journal
+   *.db-wal
+   *.db-shm
+   start.bat
+   __pycache__/
+   venv/
+   .venv/
