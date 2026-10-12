@@ -30,6 +30,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
     BotCommandScopeChat,
     CallbackQuery,
     FSInputFile,
@@ -119,6 +121,23 @@ for _ddl in (  # для старых баз данных: новые колон�
         pass
 
 router = Router()
+
+# В общих чатах бот отвечает только на расписание (+ подключение чата админом).
+# Всё остальное (/help, /hw, /id и т.д.) в группах молча игнорируется.
+GROUP_ALLOWED_CMDS = {"schedule", "расписание", "setchat", "unsetchat"}
+
+
+async def group_filter(handler, event: Message, data):
+    if event.chat.type != "private":
+        t = event.text or event.caption or ""
+        if t.startswith("/"):
+            cmd = t.split()[0][1:].split("@")[0].lower()
+            if cmd not in GROUP_ALLOWED_CMDS:
+                return None
+    return await handler(event, data)
+
+
+router.message.outer_middleware(group_filter)
 
 
 class Reg(StatesGroup):
@@ -323,6 +342,11 @@ def kb_for(uid: int) -> ReplyKeyboardMarkup:
     return {"owner": KB_OWNER, "starosta": KB_STAROSTA, "helper": KB_HELPER}.get(role_of(uid), KB)
 
 
+def kbm(m: Message):
+    """Кнопки меню показываем только в личке, в общих чатах их не должно быть."""
+    return kb_for(m.from_user.id) if m.chat.type == "private" else None
+
+
 def manager_ids() -> list[int]:
     ids = set(ADMINS)
     ids.update(r["id"] for r in db.execute("SELECT id FROM users WHERE role='starosta' AND status='approved'"))
@@ -371,7 +395,7 @@ async def interrupted(m: Message, state: FSMContext) -> bool:
     t = norm(m.text or "")
     if t in ("отмена", "cancel") or t in MENU_TEXTS:
         await state.clear()
-        await m.answer("Отменено. Выбери действие в меню 👇", reply_markup=kb_for(m.from_user.id))
+        await m.answer("Отменено. Выбери действие в меню 👇", reply_markup=kbm(m))
         return True
     return False
 
@@ -615,7 +639,7 @@ async def start(m: Message, state: FSMContext, bot: Bot):
 @router.message(Command("cancel", "отмена", ignore_case=True))
 async def cancel_cmd(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer("Отменено.", reply_markup=kb_for(m.from_user.id))
+    await m.answer("Отменено.", reply_markup=kbm(m))
 
 
 @router.message(Command("id"))
@@ -686,6 +710,7 @@ async def reg_decision(cb: CallbackQuery, bot: Bot, state: FSMContext):
         except Exception:
             pass
         await cb.answer()
+        await audit(cb.from_user, f"✅ <b>Принял заявку:</b> {esc(row['name'])}")
         return
     # отказ: спрашиваем причину, которую передадим ученику
     await state.clear()
@@ -707,7 +732,7 @@ async def reject_reason(m: Message, state: FSMContext, bot: Bot):
     uid = data["uid"]
     row = db.execute("SELECT name, status FROM users WHERE id=?", (uid,)).fetchone()
     if not row or row["status"] != "pending":
-        await m.answer("Эта заявка уже обработана.", reply_markup=kb_for(m.from_user.id))
+        await m.answer("Эта заявка уже обработана.", reply_markup=kbm(m))
         return
     reason = "" if m.text.strip() in ("-", "—") else m.text.strip()[:300]
     db.execute("DELETE FROM users WHERE id=?", (uid,))
@@ -730,8 +755,9 @@ async def reject_reason(m: Message, state: FSMContext, bot: Bot):
     except Exception:
         pass
     await m.answer(
-        "Отклонено, причина отправлена ученику." if reason else "Отклонено.", reply_markup=kb_for(m.from_user.id)
+        "Отклонено, причина отправлена ученику." if reason else "Отклонено.", reply_markup=kbm(m)
     )
+    await audit(m.from_user, f"❌ <b>Отклонил заявку:</b> {esc(row['name'])}" + (f"\nПричина: {clip(reason)}" if reason else ""))
 
 
 def help_text(uid: int) -> str:
@@ -812,7 +838,7 @@ async def me(m: Message):
 async def help_cmd(m: Message):
     if not await ensure_member(m):
         return
-    await m.answer(help_text(m.from_user.id), reply_markup=kb_for(m.from_user.id))
+    await m.answer(help_text(m.from_user.id), reply_markup=kbm(m))
 
 
 # ---------------------------------------------------------------- команды для учеников
@@ -913,7 +939,11 @@ async def setup_profile(bot: Bot):
             "старосты — всё в одном месте.\n\nНажми «Начать» и напиши фамилию и имя."
         )
         await bot.set_my_short_description("Расписание, ДЗ, контрольные и объявления класса 📚")
-        await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in BASE_CMDS])
+        await bot.delete_my_commands()  # убираем общее меню (оно показывалось и в группах)
+        await bot.set_my_commands(
+            [BotCommand(command=c, description=d) for c, d in BASE_CMDS], scope=BotCommandScopeAllPrivateChats()
+        )
+        await bot.delete_my_commands(scope=BotCommandScopeAllGroupChats())
     except Exception as e:
         logging.warning("Не удалось настроить профиль бота: %s", e)
     ids = set(ADMINS) | {
@@ -956,6 +986,33 @@ async def notify_admins(bot: Bot, text: str):
             logging.warning("Не доставлено админу %s: %s", a, e)
 
 
+BOT: Bot | None = None  # заполняется в main(), нужен для тихих логов админу
+
+
+def clip(s: str, n: int = 700) -> str:
+    s = (s or "").strip()
+    return esc(s[:n] + ("…" if len(s) > n else ""))
+
+
+async def audit(user, text: str):
+    """Тихий лог админу: кто из старост/помощников что сделал. Действия самого админа не логируются."""
+    if BOT is None or is_owner(user.id):
+        return
+    row = db.execute("SELECT name FROM users WHERE id=?", (user.id,)).fetchone()
+    name = row["name"] if row else user.full_name
+    uname = f" · @{user.username}" if user.username else ""
+    body = f"🕵️ {text}\n\n━━━━━━━━━━━━━━\n👤 <b>{esc(name)}</b> · {role_title(user.id)}{esc(uname)}"
+    for a in ADMINS:
+        try:
+            await BOT.send_message(a, body)
+        except Exception as e:
+            logging.warning("Не доставлен лог админу %s: %s", a, e)
+
+
+def repl_desc(num: int, subject: str) -> str:
+    return f"{num} урок — отменён" if subject == "-" else f"{num} урок → {esc(subject)}"
+
+
 # ---------------------------------------------------------------- команды старосты: ДЗ, события, контрольные
 @router.message(Command("addhw"))
 async def addhw(m: Message, command: CommandObject):
@@ -969,6 +1026,7 @@ async def addhw(m: Message, command: CommandObject):
     db.execute("INSERT INTO homework(subject,task,due) VALUES(?,?,?)", (args[0], args[1], d.isoformat()))
     db.commit()
     await m.answer(f"✅ Домашка добавлена на {d.strftime('%d.%m')}.")
+    await audit(m.from_user, f"➕ <b>Добавил ДЗ</b> на {d.strftime('%d.%m')}\n{esc(args[0])}: {clip(args[1])}")
 
 
 @router.message(Command("delhw"))
@@ -978,9 +1036,12 @@ async def delhw(m: Message, command: CommandObject):
     if not (command.args or "").strip().isdigit():
         await m.answer("Формат: /delhw 5 (номер из списка /hw)")
         return
+    row = db.execute("SELECT subject, task FROM homework WHERE id=?", (int(command.args),)).fetchone()
     db.execute("DELETE FROM homework WHERE id=?", (int(command.args),))
     db.commit()
     await m.answer("🗑 Удалено.")
+    if row:
+        await audit(m.from_user, f"🗑 <b>Удалил ДЗ</b>\n{esc(row['subject'])}: {clip(row['task'])}")
 
 
 @router.message(Command("addevent"))
@@ -995,6 +1056,9 @@ async def addevent(m: Message, command: CommandObject):
     db.execute("INSERT INTO events(day,text) VALUES(?,?)", (d.isoformat(), args[1]))
     db.commit()
     await m.answer("✅ Событие добавлено.")
+    await audit(m.from_user, f"📌 <b>Добавил событие</b> на {d.strftime('%d.%m')}\n{clip(args[1])}")
+    if BOT is not None:  # новое событие сразу уходит в общий чат
+        await send_to_chat(BOT, hdr("📌", "Новое событие", d.strftime("%d.%m")) + f"\n\n{esc(args[1])}")
 
 
 @router.message(Command("delevent"))
@@ -1004,9 +1068,12 @@ async def delevent(m: Message, command: CommandObject):
     if not (command.args or "").strip().isdigit():
         await m.answer("Формат: /delevent 3")
         return
+    row = db.execute("SELECT day, text FROM events WHERE id=?", (int(command.args),)).fetchone()
     db.execute("DELETE FROM events WHERE id=?", (int(command.args),))
     db.commit()
     await m.answer("🗑 Удалено.")
+    if row:
+        await audit(m.from_user, f"🗑 <b>Удалил событие</b> ({fmt(row['day'])})\n{clip(row['text'])}")
 
 
 def save_test(subject: str, d: date, topic: str):
@@ -1026,6 +1093,10 @@ async def addtest(m: Message, command: CommandObject):
         return
     save_test(parts[0], d, parts[2] if len(parts) > 2 else "")
     await m.answer(f"✅ Контрольная добавлена на {d.strftime('%d.%m')}. Напомню за 3 дня и за 1 день.")
+    await audit(
+        m.from_user,
+        f"📝 <b>Добавил контрольную</b> на {d.strftime('%d.%m')}\n{esc(parts[0])}" + (f" — {clip(parts[2])}" if len(parts) > 2 and parts[2] else ""),
+    )
 
 
 # ---------------------------------------------------------------- расписание: день, неделя, замены
@@ -1041,6 +1112,7 @@ async def setschedule(m: Message, command: CommandObject):
     db.execute("INSERT OR REPLACE INTO schedule VALUES(?,?)", (wd, args[1]))
     db.commit()
     await m.answer("✅ Расписание обновлено.\n\n" + schedule_text(next_date(wd)))
+    await audit(m.from_user, f"🗓 <b>Изменил расписание</b> ({DAYS_FULL[wd]})\n{clip(args[1])}")
 
 
 def apply_week(text: str) -> tuple[list[str], list[str]]:
@@ -1093,6 +1165,7 @@ async def setweek(m: Message, command: CommandObject, state: FSMContext):
         await m.answer(WEEK_HINT)
         return
     await m.answer(week_reply(command.args))
+    await audit(m.from_user, f"🗓 <b>Изменил расписание недели</b>\n{clip(command.args)}")
 
 
 def apply_replacement(d: date, num: int, subject: str) -> str | None:
@@ -1134,6 +1207,7 @@ async def replace_cmd(m: Message, command: CommandObject, bot: Bot):
         return
     sent, in_chat = await announce_replacement(bot, d, int(args[1]), args[2])
     await m.answer(f"✅ Замена сохранена и разослана: {sent}" + (" + общий чат" if in_chat else ""))
+    await audit(m.from_user, f"🔄 <b>Сделал замену</b> на {d.strftime('%d.%m')}\n{repl_desc(int(args[1]), args[2])}")
 
 
 @router.message(Command("clearreplace"))
@@ -1147,6 +1221,7 @@ async def clearreplace(m: Message, command: CommandObject):
     db.execute("DELETE FROM changes WHERE date=?", (d.isoformat(),))
     db.commit()
     await m.answer(f"🗑 Замены на {d.strftime('%d.%m')} убраны.")
+    await audit(m.from_user, f"🗑 <b>Убрал замены</b> на {d.strftime('%d.%m')}")
 
 
 # ---------------------------------------------------------------- дежурные
@@ -1163,6 +1238,7 @@ async def setduty(m: Message, command: CommandObject):
     db.commit()
     note = "" if not rotation_on() else "\n(Сейчас включено дежурство по кругу — оно главнее. Выключить: /dutyoff)"
     await m.answer("✅ Дежурные записаны." + note)
+    await audit(m.from_user, f"🧹 <b>Изменил дежурных</b> ({DAYS_FULL[wd]})\n{clip(args[1])}")
 
 
 @router.message(Command("dutypool"))
@@ -1178,6 +1254,7 @@ async def dutypool(m: Message, command: CommandObject):
     if not get_setting("duty_per"):
         set_setting("duty_per", "2")
     await m.answer("✅ Дежурство по кругу включено (начиная с ближайшего будня).\n\n" + duty_text())
+    await audit(m.from_user, f"🧹 <b>Включил дежурство по кругу</b>\n{clip(', '.join(names))}")
 
 
 @router.message(Command("dutyper"))
@@ -1190,6 +1267,7 @@ async def dutyper(m: Message, command: CommandObject):
         return
     set_setting("duty_per", n)
     await m.answer("✅ Готово.\n\n" + duty_text())
+    await audit(m.from_user, f"🧹 <b>Дежурных в день:</b> {n}")
 
 
 @router.message(Command("dutyoff"))
@@ -1198,6 +1276,7 @@ async def dutyoff(m: Message):
         return
     del_setting("duty_anchor")
     await m.answer("Дежурство по кругу выключено. Работает ручной график (/setduty).")
+    await audit(m.from_user, "🧹 <b>Выключил дежурство по кругу</b>")
 
 
 # ---------------------------------------------------------------- дни рождения
@@ -1213,6 +1292,7 @@ async def addbd(m: Message, command: CommandObject):
     db.execute("INSERT INTO birthdays(name,day,month,year) VALUES(?,?,?,?)", (args[0], *dm))
     db.commit()
     await m.answer("🎂 Добавлено.")
+    await audit(m.from_user, f"🎂 <b>Добавил день рождения</b>\n{esc(args[0])} — {esc(args[1])}")
 
 
 @router.message(Command("delbd"))
@@ -1226,6 +1306,7 @@ async def delbd(m: Message, command: CommandObject):
         return
     db.execute("DELETE FROM birthdays WHERE id=?", (found[0]["id"],))
     db.commit()
+    await audit(m.from_user, f"🎂 <b>Удалил день рождения</b>\n{esc(found[0]['name'])}")
     await m.answer(f"🗑 Удалено: {esc(found[0]['name'])}")
 
 
@@ -1292,6 +1373,7 @@ async def announce(m: Message, command: CommandObject, bot: Bot, state: FSMConte
     ann_id = new_announcement("text", None, command.args, by)
     sent, in_chat = await deliver_ann(bot, ann_id, "text", None, command.args, by=by)
     await m.answer(f"Отправлено ученикам: {sent}" + (" и в общий чат ✅" if in_chat else ""))
+    await audit(m.from_user, f"📢 <b>Отправил объявление</b> (получили: {sent})\n<blockquote>{clip(command.args, 1500)}</blockquote>")
 
 
 @router.callback_query(F.data.startswith("read:"))
@@ -1348,6 +1430,7 @@ async def nudge(cb: CallbackQuery, bot: Bot):
         only_ids=[u["id"] for u in not_read], reminder=True, by=ann["by_role"] or "admin",
     )
     await cb.message.answer(f"🔔 Напомнила: {sent}")
+    await audit(cb.from_user, f"🔔 <b>Напомнил о непрочитанном объявлении</b> #{ann_id} (получили: {sent})")
 
 
 # ---------------------------------------------------------------- опросы с подсчётом голосов
@@ -1444,13 +1527,14 @@ async def pollresult(m: Message):
 async def pollclose(m: Message):
     if not await manager_only(m):
         return
-    poll = db.execute("SELECT id FROM polls ORDER BY id DESC LIMIT 1").fetchone()
+    poll = db.execute("SELECT id, question FROM polls ORDER BY id DESC LIMIT 1").fetchone()
     if not poll:
         await m.answer("Опросов ещё не было.")
         return
     db.execute("UPDATE polls SET closed=1 WHERE id=?", (poll["id"],))
     db.commit()
     await m.answer("🔒 Опрос закрыт. Итоги: /pollresult")
+    await audit(m.from_user, f"🔒 <b>Закрыл опрос</b>\n{clip(poll['question'])}")
 
 
 # ---------------------------------------------------------------- общий чат, ученики, резервная копия
@@ -1526,6 +1610,7 @@ async def addhelper(m: Message, command: CommandObject, bot: Bot):
             logging.warning("Не удалось уведомить %s: %s", r["id"], e)
         await apply_commands(bot, r["id"])
         await m.answer(f"🛠 {esc(r['name'])} теперь помощник.")
+        await audit(m.from_user, f"🛠 <b>Назначил помощника:</b> {esc(r['name'])}")
 
 
 @router.message(Command("delhelper"))
@@ -1546,6 +1631,7 @@ async def delhelper(m: Message, command: CommandObject, bot: Bot):
         logging.warning("Не удалось уведомить %s: %s", r["id"], e)
     await apply_commands(bot, r["id"])
     await m.answer(f"Роль помощника снята: {esc(r['name'])}")
+    await audit(m.from_user, f"🛠 <b>Снял роль помощника:</b> {esc(r['name'])}")
 
 
 @router.message(Command("helpers"))
@@ -1695,6 +1781,7 @@ async def deluser(m: Message, command: CommandObject):
         db.execute("DELETE FROM users WHERE id=?", (target,))
         db.commit()
         await m.answer(f"🗑 Удалён: {esc(found[0]['name'])}")
+        await audit(m.from_user, f"🗑 <b>Удалил ученика:</b> {esc(found[0]['name'])}")
 
 
 def make_backup() -> str:
@@ -1799,7 +1886,8 @@ async def hw_due(m: Message, state: FSMContext):
     )
     db.commit()
     await state.clear()
-    await m.answer(f"✅ Добавлено: {esc(data['subject'])} на {d.strftime('%d.%m')}.", reply_markup=kb_for(m.from_user.id))
+    await m.answer(f"✅ Добавлено: {esc(data['subject'])} на {d.strftime('%d.%m')}.", reply_markup=kbm(m))
+    await audit(m.from_user, f"➕ <b>Добавил ДЗ</b> на {d.strftime('%d.%m')}\n{esc(data['subject'])}: {clip(data['task'])}")
 
 
 @router.message(F.chat.type == "private", F.text == "📝 Контрольная")
@@ -1844,7 +1932,11 @@ async def test_topic(m: Message, state: FSMContext):
     await state.clear()
     await m.answer(
         f"✅ Контрольная по {esc(data['subject'])} на {d.strftime('%d.%m')} добавлена. Напомню за 3 дня и за 1 день.",
-        reply_markup=kb_for(m.from_user.id),
+        reply_markup=kbm(m),
+    )
+    await audit(
+        m.from_user,
+        f"📝 <b>Добавил контрольную</b> на {d.strftime('%d.%m')}\n{esc(data['subject'])}" + (f" — {clip(topic)}" if topic else ""),
     )
 
 
@@ -1903,6 +1995,11 @@ async def ann_send(cb: CallbackQuery, state: FSMContext, bot: Bot):
     await cb.message.answer(
         f"✅ Отправлено ученикам: {sent}" + (" и в общий чат" if in_chat else "") + "\nКто прочитал: /unread"
     )
+    kind_ru = {"photo": "с фото", "document": "с файлом"}.get(data["kind"], "")
+    await audit(
+        cb.from_user,
+        f"📢 <b>Отправил объявление</b> {kind_ru} (получили: {sent})\n<blockquote>{clip(data.get('text', ''), 1500) or '—'}</blockquote>",
+    )
 
 
 @router.callback_query(F.data == "ann:cancel")
@@ -1946,8 +2043,9 @@ async def poll_opts(m: Message, state: FSMContext, bot: Bot):
     sent, in_chat = await send_poll(bot, data["question"], opts)
     await m.answer(
         f"✅ Опрос отправлен: {sent}" + (" + общий чат" if in_chat else "") + "\nИтоги с именами: /pollresult",
-        reply_markup=kb_for(m.from_user.id),
+        reply_markup=kbm(m),
     )
+    await audit(m.from_user, f"📊 <b>Отправил опрос</b> (получили: {sent})\n{clip(data['question'])}\n" + "\n".join(f"▫️ {esc(o)}" for o in opts))
 
 
 @router.message(F.chat.type == "private", F.text == "🔄 Замена")
@@ -1993,14 +2091,15 @@ async def repl_subject(m: Message, state: FSMContext, bot: Bot):
     err = apply_replacement(d, num, subject)
     if err:
         await state.clear()
-        await m.answer(err + "\nНачни заново: 🔄 Замена.", reply_markup=kb_for(m.from_user.id))
+        await m.answer(err + "\nНачни заново: 🔄 Замена.", reply_markup=kbm(m))
         return
     await state.clear()
     sent, in_chat = await announce_replacement(bot, d, num, subject)
     await m.answer(
         f"✅ Замена сохранена и разослана: {sent}" + (" + общий чат" if in_chat else ""),
-        reply_markup=kb_for(m.from_user.id),
+        reply_markup=kbm(m),
     )
+    await audit(m.from_user, f"🔄 <b>Сделал замену</b> на {d.strftime('%d.%m')}\n{repl_desc(num, subject)}")
 
 
 @router.message(F.chat.type == "private", F.text == "🗓 Неделя")
@@ -2017,7 +2116,8 @@ async def week_text(m: Message, state: FSMContext):
     if await interrupted(m, state) or not m.text:
         return
     await state.clear()
-    await m.answer(week_reply(m.text), reply_markup=kb_for(m.from_user.id))
+    await m.answer(week_reply(m.text), reply_markup=kbm(m))
+    await audit(m.from_user, f"🗓 <b>Изменил расписание недели</b>\n{clip(m.text)}")
 
 
 @router.message(F.chat.type == "private", F.text == "👥 Заявки")
@@ -2114,7 +2214,8 @@ async def scheduler(bot: Bot):
 
 async def main():
     logging.basicConfig(level=logging.INFO)
-    bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    global BOT
+    bot = BOT = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await setup_profile(bot)
