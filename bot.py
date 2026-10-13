@@ -5,7 +5,7 @@
     export ADMIN_IDS="123456789"             # id АДМИНА бота (только ты). Старост назначай командой /addstarosta
     export TZ_NAME="Europe/Moscow"           # часовой пояс (необязательно)
     export REMIND_HOUR="19"                  # вечерние напоминания (необязательно)
-    export MORNING_HOUR="8"                  # утренние поздравления (необязательно)
+    export DB_PATH="/data/class.db"          # путь к базе в ПОСТОЯННОМ хранилище (важно!)
     export BACKUP_HOUR="22"                  # резервная копия базы старосте (необязательно)
     export SHIFT="1"                         # смена: 1 или 2 (необязательно)
     python bot.py
@@ -46,7 +46,6 @@ TOKEN = os.environ["BOT_TOKEN"]
 ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Moscow"))
 REMIND_HOUR = int(os.getenv("REMIND_HOUR", "19"))
-MORNING_HOUR = int(os.getenv("MORNING_HOUR", "8"))
 BACKUP_HOUR = int(os.getenv("BACKUP_HOUR", "22"))
 SHIFT = os.getenv("SHIFT", "1")  # 1 — первая смена (1, 4–11 классы), 2 — вторая (2–3 классы)
 
@@ -87,25 +86,38 @@ def num_emoji(n: int) -> str:
 
 
 # ---------------------------------------------------------------- база данных
-DB_PATH = os.getenv("DB_PATH", "class.db")  # на сервере укажи путь в постоянном хранилище, напр. /data/class.db
-os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+def _default_db_path() -> str:
+    """Путь к базе. Раньше был относительный 'class.db' — он зависел от папки запуска
+    и терялся при перезапуске/деплое. Теперь: DB_PATH из окружения -> /data (если есть
+    постоянный диск) -> папка с bot.py (всегда один и тот же файл)."""
+    env = os.getenv("DB_PATH")
+    if env:
+        return os.path.abspath(env)
+    if os.path.isdir("/data") and os.access("/data", os.W_OK):
+        return "/data/class.db"
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "class.db")
+
+
+DB_PATH = _default_db_path()
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 db = sqlite3.connect(DB_PATH)
 db.row_factory = sqlite3.Row
+db.execute("PRAGMA journal_mode=WAL")
+db.execute("PRAGMA synchronous=FULL")
+logging.basicConfig(level=logging.INFO)
+logging.info("База данных: %s", DB_PATH)
 db.executescript(
     """
     CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT, status TEXT DEFAULT 'approved', role TEXT DEFAULT 'student');
     CREATE TABLE IF NOT EXISTS homework(id INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT, task TEXT, due TEXT);
     CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT, text TEXT, kind TEXT DEFAULT 'event');
     CREATE TABLE IF NOT EXISTS schedule(day INTEGER PRIMARY KEY, lessons TEXT);
-    CREATE TABLE IF NOT EXISTS duty(day INTEGER PRIMARY KEY, people TEXT);
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
     CREATE TABLE IF NOT EXISTS changes(date TEXT, num INTEGER, subject TEXT, PRIMARY KEY(date, num));
-    CREATE TABLE IF NOT EXISTS birthdays(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, day INTEGER, month INTEGER, year INTEGER);
     CREATE TABLE IF NOT EXISTS announcements(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, file_id TEXT, text TEXT, by_role TEXT DEFAULT 'admin');
     CREATE TABLE IF NOT EXISTS reads(ann_id INTEGER, user_id INTEGER, PRIMARY KEY(ann_id, user_id));
     CREATE TABLE IF NOT EXISTS polls(id INTEGER PRIMARY KEY AUTOINCREMENT, question TEXT, options TEXT, closed INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS votes(poll_id INTEGER, user_id INTEGER, opt INTEGER, name TEXT, PRIMARY KEY(poll_id, user_id));
-    DROP TABLE IF EXISTS absent;
     """
 )
 for _ddl in (  # для старых баз данных: новые колонки
@@ -122,9 +134,9 @@ for _ddl in (  # для старых баз данных: новые колон�
 
 router = Router()
 
-# В общих чатах бот отвечает только на расписание (+ подключение чата админом).
-# Всё остальное (/help, /hw, /id и т.д.) в группах молча игнорируется.
-GROUP_ALLOWED_CMDS = {"schedule", "расписание", "setchat", "unsetchat"}
+# В общих чатах бот только присылает оповещения и ни на какие команды не отвечает.
+# Исключение: /setchat и /unsetchat (подключение чата админом).
+GROUP_ALLOWED_CMDS = {"setchat", "unsetchat"}
 
 
 async def group_filter(handler, event: Message, data):
@@ -276,9 +288,7 @@ def del_setting(key: str):
 
 
 STUDENT_ROWS = [
-    ["📚 Домашка", "🗓 Расписание"],
-    ["📌 События", "🧹 Дежурные"],
-    ["🌙 Завтра", "🎂 Дни рождения"],
+    ["🗓 Расписание", "📌 События"],
 ]
 ADMIN_ROWS = [
     ["➕ Добавить ДЗ", "📝 Контрольная"],
@@ -409,7 +419,7 @@ def chat_id() -> int | None:
     return int(v) if v else None
 
 
-# ---------------------------------------------------------------- тексты: ДЗ, расписание, события, дежурства
+# ---------------------------------------------------------------- тексты: ДЗ, расписание, события
 def hw_text(show_ids: bool = False) -> str:
     rows = db.execute(
         "SELECT * FROM homework WHERE due>=? ORDER BY due, subject", (today().isoformat(),)
@@ -434,7 +444,13 @@ def schedule_text(d: date, with_title: bool = True) -> str:
     title = hdr("🗓", DAYS_FULL[wd], d.strftime("%d.%m"))
     row = db.execute("SELECT lessons FROM schedule WHERE day=?", (wd,)).fetchone()
     if not row:
-        return (title + "\n\n" if with_title else "") + "😴 Расписание не задано."
+        out = (title + "\n\n" if with_title else "") + "😴 Расписание не задано."
+        rest0 = db.execute("SELECT * FROM homework WHERE due=?", (d.isoformat(),)).fetchall()
+        if rest0:
+            out += "\n\n📚 <b>ДЗ на этот день</b>\n" + "\n".join(
+                f"▫️ <b>{esc(h['subject'])}</b>\n     <code>ДЗ: {esc(h['task'])}</code>" for h in rest0
+            )
+        return out
     lessons = [x.strip() for x in row["lessons"].split(",") if x.strip()]
     changes = {
         r["num"]: r["subject"]
@@ -488,64 +504,6 @@ def events_text(show_ids: bool = False) -> str:
     return "\n".join(lines)
 
 
-# --- дежурные: по кругу (авто) или по дням недели (вручную)
-def duty_pool() -> list[str]:
-    s = get_setting("duty_pool") or ""
-    return [x.strip() for x in s.split(",") if x.strip()]
-
-
-def rotation_on() -> bool:
-    return bool(duty_pool() and get_setting("duty_anchor"))
-
-
-def duty_for(d: date) -> list[str] | None:
-    """Дежурные на дату при ротации по кругу (только будни)."""
-    pool = duty_pool()
-    anchor_s = get_setting("duty_anchor")
-    if not pool or not anchor_s or d.weekday() >= 5:
-        return None
-    anchor = date.fromisoformat(anchor_s)
-    while anchor.weekday() >= 5:
-        anchor += timedelta(days=1)
-    if d < anchor:
-        return None
-    n, cur = 0, anchor
-    while cur < d:
-        cur += timedelta(days=1)
-        if cur.weekday() < 5:
-            n += 1
-    per = max(1, min(int(get_setting("duty_per") or 2), len(pool)))
-    return [pool[(n * per + k) % len(pool)] for k in range(per)]
-
-
-def duty_names_for(d: date) -> str | None:
-    if rotation_on():
-        names = duty_for(d)
-        return ", ".join(names) if names else None
-    row = db.execute("SELECT people FROM duty WHERE day=?", (d.weekday(),)).fetchone()
-    return row["people"] if row else None
-
-
-def duty_text() -> str:
-    if rotation_on():
-        lines = [hdr("🧹", "Дежурные", "по очереди"), ""]
-        d, shown = today(), 0
-        while shown < 5 and d <= today() + timedelta(days=30):
-            names = duty_for(d)
-            if names:
-                mark = "👉 " if d == today() else "▫️ "
-                lines.append(f"{mark}<b>{DAYS[d.weekday()].capitalize()} {d.strftime('%d.%m')}</b> — {esc(', '.join(names))}")
-                shown += 1
-            d += timedelta(days=1)
-        return "\n".join(lines) if shown else hdr("🧹", "Дежурные") + "\n\n⏳ Очередь дежурных ещё не началась."
-    rows = db.execute("SELECT * FROM duty ORDER BY day").fetchall()
-    if not rows:
-        return hdr("🧹", "Дежурные") + "\n\n📭 График дежурств не задан."
-    lines = [hdr("🧹", "Дежурные"), ""]
-    lines += [f"▫️ <b>{DAYS_FULL[r['day']]}</b> — {esc(r['people'])}" for r in rows]
-    return "\n".join(lines)
-
-
 def tomorrow_text(include_tests: bool = True) -> str:
     t = today() + timedelta(days=1)
     parts = ["🗓 <b>Уроки</b>\n" + schedule_text(t, with_title=False)]
@@ -554,59 +512,8 @@ def tomorrow_text(include_tests: bool = True) -> str:
         ev = [r for r in ev if r["kind"] != "test"]
     if ev:
         parts.append("📌 <b>События</b>\n" + "\n".join(f"▫️ {ev_label(r)}" for r in ev))
-    duty = duty_names_for(t)
-    if duty:
-        parts.append(f"🧹 <b>Дежурные</b>\n▫️ {esc(duty)}")
     title = hdr("🌙", "Завтра", f"{DAYS_FULL[t.weekday()]}, {t.strftime('%d.%m')}")
     return title + "\n\n" + "\n\n".join(parts)
-
-
-# --- дни рождения
-def parse_dm(text: str):
-    m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?", text.strip())
-    if not m:
-        return None
-    day, month = int(m.group(1)), int(m.group(2))
-    year = int(m.group(3)) if m.group(3) else None
-    try:
-        date(2000, month, day)  # 2000 — високосный, 29.02 допустимо
-    except ValueError:
-        return None
-    return day, month, year
-
-
-def days_until(day: int, month: int) -> int:
-    t = today()
-    for y in (t.year, t.year + 1):
-        try:
-            d = date(y, month, day)
-        except ValueError:
-            continue
-        if d >= t:
-            return (d - t).days
-    return 999
-
-
-def birthdays_text() -> str:
-    rows = db.execute("SELECT * FROM birthdays").fetchall()
-    title = hdr("🎂", "Дни рождения")
-    if not rows:
-        return f"{title}\n\n📭 Пока никого не добавили."
-    rows = sorted(rows, key=lambda r: days_until(r["day"], r["month"]))[:15]
-    lines = [title, ""]
-    for r in rows:
-        n = days_until(r["day"], r["month"])
-        when = "🎉 <b>сегодня!</b>" if n == 0 else ("завтра" if n == 1 else f"через {n} дн.")
-        lines.append(f"🎈 <code>{r['day']:02d}.{r['month']:02d}</code> — {esc(r['name'])} · {when}")
-    return "\n".join(lines)
-
-
-def birthday_people(d: date) -> list[str]:
-    out = []
-    for r in db.execute("SELECT * FROM birthdays WHERE day=? AND month=?", (d.day, d.month)).fetchall():
-        age = f" ({d.year - r['year']})" if r["year"] else ""
-        out.append(f"{esc(r['name'])}{age}")
-    return out
 
 
 # ---------------------------------------------------------------- регистрация (с подтверждением старосты)
@@ -630,7 +537,7 @@ async def start(m: Message, state: FSMContext, bot: Bot):
         return
     await m.answer(
         "👋 <b>Привет! Я бот нашего класса.</b>\n\n"
-        "📚 домашка · 🗓 расписание · 🔄 замены\n📝 контрольные · 🧹 дежурные · 📢 объявления\n\n"
+        "📚 домашка · 🗓 расписание · 🔄 замены\n📝 контрольные · 📢 объявления\n\n"
         "✏️ Напиши свою <b>фамилию и имя</b>, и я тебя запомню."
     )
     await state.set_state(Reg.name)
@@ -765,12 +672,11 @@ def help_text(uid: int) -> str:
     parts = [hdr("❓", "Справка", ROLE_TITLES[role])]
     parts.append(
         "<b>🎓 Для всех</b>\n"
-        "▫️ <code>домашка</code> — домашнее задание\n"
-        "▫️ <code>расписание</code> · <code>расписание завтра</code> · <code>расписание пт</code>\n"
+        "▫️ <code>расписание</code> · <code>расписание завтра</code> · <code>расписание пт</code> — "
+        "уроки и домашка по ним\n"
         "▫️ <code>события</code> — контрольные и мероприятия\n"
-        "▫️ <code>дежурные</code> · <code>завтра</code> · <code>дни рождения</code>\n"
         "▫️ /me — мой профиль\n"
-        "<i>Всё это есть на кнопках внизу. Можно и со слэшем: /дз, /расписание…</i>"
+        "<i>Расписание и события есть на кнопках внизу. Остальное можно просто написать словами.</i>"
     )
     if role == "helper":
         parts.append(
@@ -787,18 +693,13 @@ def help_text(uid: int) -> str:
         )
         parts.append(
             "<b>📚 Учёба</b>\n"
-            "▫️ /addhw Предмет | Задание | ДД.ММ · /delhw id\n"
+            "▫️ /addhw Предмет | Задание | ДД.ММ · /hw — список с номерами · /delhw id\n"
             "▫️ /addtest Алгебра | 15.10 | Тема\n"
             "▫️ /addevent ДД.ММ | Описание · /delevent id\n"
             "▫️ /setweek (по строке на день: «Пн: РОВ, Математика»)\n"
             "▫️ /setschedule Пн | Математика, Русский\n"
             "▫️ /replace Пт | 3 | Физика («-» вместо предмета = урок отменён)\n"
             "▫️ /clearreplace Пт — убрать замены на день"
-        )
-        parts.append(
-            "<b>🧹 Дежурства</b>\n"
-            "▫️ /dutypool Иванов, Петров, … · /dutyper 2 · /dutyoff\n"
-            "▫️ /setduty Пн | Иванов, Петров — вручную по дням"
         )
         parts.append(
             "<b>📢 Связь</b>\n"
@@ -808,8 +709,7 @@ def help_text(uid: int) -> str:
         parts.append(
             "<b>👥 Люди</b>\n"
             "▫️ /users · /deluser Иванов\n"
-            "▫️ /addhelper Иванов · /delhelper Иванов · /helpers\n"
-            "▫️ /addbd Иванов Иван | 25.03.2011 · /delbd Иванов"
+            "▫️ /addhelper Иванов · /delhelper Иванов · /helpers"
         )
     if role == "owner":
         parts.append(
@@ -844,8 +744,12 @@ async def help_cmd(m: Message):
 # ---------------------------------------------------------------- команды для учеников
 @router.message(Command("hw", "дз", "домашка", ignore_case=True))
 async def hw(m: Message):
-    if await ensure_member(m):
-        await m.answer(hw_text(can_manage(m.from_user.id)))
+    if not await ensure_member(m):
+        return
+    if can_manage(m.from_user.id):  # староста: список ДЗ с номерами для /delhw
+        await m.answer(hw_text(True))
+    else:
+        await m.answer("📚 Домашка теперь в расписании: нажми «🗓 Расписание» или напиши «расписание завтра».")
 
 
 async def send_schedule(m: Message, arg: str):
@@ -877,33 +781,14 @@ async def events(m: Message):
         await m.answer(events_text(can_manage(m.from_user.id)))
 
 
-@router.message(Command("duty", "дежурные", ignore_case=True))
-async def duty(m: Message):
-    if await ensure_member(m):
-        await m.answer(duty_text())
-
-
-@router.message(Command("tomorrow", "завтра", ignore_case=True))
-async def tomorrow(m: Message):
-    if await ensure_member(m):
-        await m.answer(tomorrow_text())
-
-
-@router.message(Command("birthdays", "др", ignore_case=True))
-async def birthdays(m: Message):
-    if await ensure_member(m):
-        await m.answer(birthdays_text())
-
-
 # ---------------------------------------------------------------- меню команд и профиль бота
 BASE_CMDS = [
-    ("hw", "Домашнее задание"), ("schedule", "Расписание: сегодня, завтра, день недели"),
-    ("tomorrow", "Что будет завтра"), ("events", "События и контрольные"), ("duty", "Дежурные"),
-    ("birthdays", "Дни рождения"), ("me", "Мой профиль"), ("help", "Помощь"),
+    ("schedule", "Расписание и ДЗ: сегодня, завтра, день недели"),
+    ("events", "События и контрольные"), ("me", "Мой профиль"), ("help", "Помощь"),
 ]
 HELPER_CMDS = [("addhw", "Добавить ДЗ"), ("addtest", "Добавить контрольную"), ("announce", "Отправить объявление")]
 MANAGER_CMDS = [
-    ("setweek", "Расписание на неделю"), ("replace", "Замена урока"), ("unread", "Кто не прочитал объявление"),
+    ("hw", "Список ДЗ с номерами"), ("setweek", "Расписание на неделю"), ("replace", "Замена урока"), ("unread", "Кто не прочитал объявление"),
     ("pollresult", "Итоги опроса"), ("users", "Список учеников"), ("helpers", "Помощники"),
 ]
 OWNER_CMDS = [("backup", "Копия базы данных"), ("setchat", "Подключить общий чат"), ("starostas", "Старосты")]
@@ -935,7 +820,7 @@ async def setup_profile(bot: Bot):
     """Описание бота, краткое описание и общее меню команд (для учеников)."""
     try:
         await bot.set_my_description(
-            "Бот нашего класса 📚\n\nРасписание, домашка, замены, контрольные, дежурные и объявления "
+            "Бот нашего класса 📚\n\nРасписание, домашка, замены, контрольные и объявления "
             "старосты — всё в одном месте.\n\nНажми «Начать» и напиши фамилию и имя."
         )
         await bot.set_my_short_description("Расписание, ДЗ, контрольные и объявления класса 📚")
@@ -1152,7 +1037,7 @@ def week_reply(text: str) -> str:
     if done:
         out += "✅ Сохранено:\n" + "\n".join(done)
     if bad:
-        out += ("\n\n" if out else "") + "⚠️ Не поняла эти строки:\n" + "\n".join(esc(b) for b in bad)
+        out += ("\n\n" if out else "") + "⚠️ Не понял эти строки:\n" + "\n".join(esc(b) for b in bad)
     return out or "Ничего не распознано. " + WEEK_HINT
 
 
@@ -1222,92 +1107,6 @@ async def clearreplace(m: Message, command: CommandObject):
     db.commit()
     await m.answer(f"🗑 Замены на {d.strftime('%d.%m')} убраны.")
     await audit(m.from_user, f"🗑 <b>Убрал замены</b> на {d.strftime('%d.%m')}")
-
-
-# ---------------------------------------------------------------- дежурные
-@router.message(Command("setduty"))
-async def setduty(m: Message, command: CommandObject):
-    if not await manager_only(m):
-        return
-    args = split_args(command, 2)
-    wd = parse_day(args[0]) if args else None
-    if wd is None:
-        await m.answer("Формат: /setduty Пн | Иванов, Петров")
-        return
-    db.execute("INSERT OR REPLACE INTO duty VALUES(?,?)", (wd, args[1]))
-    db.commit()
-    note = "" if not rotation_on() else "\n(Сейчас включено дежурство по кругу — оно главнее. Выключить: /dutyoff)"
-    await m.answer("✅ Дежурные записаны." + note)
-    await audit(m.from_user, f"🧹 <b>Изменил дежурных</b> ({DAYS_FULL[wd]})\n{clip(args[1])}")
-
-
-@router.message(Command("dutypool"))
-async def dutypool(m: Message, command: CommandObject):
-    if not await manager_only(m):
-        return
-    names = [x.strip() for x in (command.args or "").replace("\n", ",").split(",") if x.strip()]
-    if len(names) < 2:
-        await m.answer("Формат: /dutypool Иванов, Петров, Сидоров, … (весь список класса по порядку)")
-        return
-    set_setting("duty_pool", ", ".join(names))
-    set_setting("duty_anchor", today().isoformat())
-    if not get_setting("duty_per"):
-        set_setting("duty_per", "2")
-    await m.answer("✅ Дежурство по кругу включено (начиная с ближайшего будня).\n\n" + duty_text())
-    await audit(m.from_user, f"🧹 <b>Включил дежурство по кругу</b>\n{clip(', '.join(names))}")
-
-
-@router.message(Command("dutyper"))
-async def dutyper(m: Message, command: CommandObject):
-    if not await manager_only(m):
-        return
-    n = (command.args or "").strip()
-    if not n.isdigit() or not 1 <= int(n) <= 10:
-        await m.answer("Формат: /dutyper 2 (сколько человек дежурит в день)")
-        return
-    set_setting("duty_per", n)
-    await m.answer("✅ Готово.\n\n" + duty_text())
-    await audit(m.from_user, f"🧹 <b>Дежурных в день:</b> {n}")
-
-
-@router.message(Command("dutyoff"))
-async def dutyoff(m: Message):
-    if not await manager_only(m):
-        return
-    del_setting("duty_anchor")
-    await m.answer("Дежурство по кругу выключено. Работает ручной график (/setduty).")
-    await audit(m.from_user, "🧹 <b>Выключил дежурство по кругу</b>")
-
-
-# ---------------------------------------------------------------- дни рождения
-@router.message(Command("addbd"))
-async def addbd(m: Message, command: CommandObject):
-    if not await manager_only(m):
-        return
-    args = split_args(command, 2)
-    dm = parse_dm(args[1]) if args else None
-    if not args or not dm:
-        await m.answer("Формат: /addbd Иванов Иван | 25.03.2011 (год можно не писать)")
-        return
-    db.execute("INSERT INTO birthdays(name,day,month,year) VALUES(?,?,?,?)", (args[0], *dm))
-    db.commit()
-    await m.answer("🎂 Добавлено.")
-    await audit(m.from_user, f"🎂 <b>Добавил день рождения</b>\n{esc(args[0])} — {esc(args[1])}")
-
-
-@router.message(Command("delbd"))
-async def delbd(m: Message, command: CommandObject):
-    if not await manager_only(m):
-        return
-    q = (command.args or "").strip().casefold()
-    found = [r for r in db.execute("SELECT * FROM birthdays").fetchall() if q and q in r["name"].casefold()]
-    if len(found) != 1:
-        await m.answer("Нашла не одного человека. Уточни имя: /delbd Иванов Иван" if found else "Не нашла такого.")
-        return
-    db.execute("DELETE FROM birthdays WHERE id=?", (found[0]["id"],))
-    db.commit()
-    await audit(m.from_user, f"🎂 <b>Удалил день рождения</b>\n{esc(found[0]['name'])}")
-    await m.answer(f"🗑 Удалено: {esc(found[0]['name'])}")
 
 
 # ---------------------------------------------------------------- объявления (текст / фото / файл), «прочитал»
@@ -1381,7 +1180,7 @@ async def mark_read(cb: CallbackQuery):
     ann_id = int(cb.data.split(":")[1])
     db.execute("INSERT OR IGNORE INTO reads VALUES(?,?)", (ann_id, cb.from_user.id))
     db.commit()
-    await cb.answer("Отметила ✅")
+    await cb.answer("Отметил ✅")
     try:
         await cb.message.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -1429,7 +1228,7 @@ async def nudge(cb: CallbackQuery, bot: Bot):
         bot, ann_id, ann["kind"], ann["file_id"], ann["text"],
         only_ids=[u["id"] for u in not_read], reminder=True, by=ann["by_role"] or "admin",
     )
-    await cb.message.answer(f"🔔 Напомнила: {sent}")
+    await cb.message.answer(f"🔔 Напомнил: {sent}")
     await audit(cb.from_user, f"🔔 <b>Напомнил о непрочитанном объявлении</b> #{ann_id} (получили: {sent})")
 
 
@@ -1878,7 +1677,7 @@ async def hw_due(m: Message, state: FSMContext):
         return
     d = parse_date(m.text)
     if not d:
-        await m.answer("Не поняла дату. Примеры: 12.10, завтра, пт.")
+        await m.answer("Не понял дату. Примеры: 12.10, завтра, пт.")
         return
     data = await state.get_data()
     db.execute(
@@ -1914,7 +1713,7 @@ async def test_due(m: Message, state: FSMContext):
         return
     d = parse_date(m.text)
     if not d:
-        await m.answer("Не поняла дату. Примеры: 15.10, завтра, пт.")
+        await m.answer("Не понял дату. Примеры: 15.10, завтра, пт.")
         return
     await state.update_data(due=d.isoformat())
     await state.set_state(TestW.topic)
@@ -2063,7 +1862,7 @@ async def repl_day(m: Message, state: FSMContext):
         return
     d = parse_date(m.text)
     if not d:
-        await m.answer("Не поняла дату. Примеры: 16.10, завтра, пт.")
+        await m.answer("Не понял дату. Примеры: 16.10, завтра, пт.")
         return
     await state.update_data(day=d.isoformat())
     await state.set_state(Repl.num)
@@ -2139,9 +1938,6 @@ async def pending_list(m: Message):
 WORDS = {
     "домашка": hw, "дз": hw, "домашнее задание": hw, "домашние задания": hw, "домашнее": hw,
     "события": events, "контрольные": events,
-    "дежурные": duty, "дежурство": duty,
-    "завтра": tomorrow, "что завтра": tomorrow,
-    "дни рождения": birthdays, "др": birthdays, "именинники": birthdays,
     "помощь": help_cmd, "команды": help_cmd, "меню": help_cmd,
 }
 
@@ -2172,21 +1968,10 @@ async def test_reminders(bot: Bot):
             await send_to_chat(bot, text)
 
 
-async def job_morning(bot: Bot, now: datetime):
-    people = birthday_people(today())
-    if people:
-        text = hdr("🎉", "Сегодня день рождения!") + "\n\n" + "\n".join(f"🎂 {p}" for p in people) + "\n\nПоздравляем! 🥳"
-        if not await send_to_chat(bot, text):
-            await broadcast(bot, text)
-
-
 async def job_evening(bot: Bot, now: datetime):
     await test_reminders(bot)
     if now.weekday() != 5:  # в субботу вечернюю сводку не шлём
         await broadcast(bot, tomorrow_text(include_tests=False))
-    people = birthday_people(today() + timedelta(days=1))
-    if people:
-        await notify_admins(bot, "🎂 <b>Завтра день рождения:</b> " + ", ".join(people) + "\nНе забудь подготовить поздравление! 🎁")
 
 
 async def job_backup(bot: Bot, now: datetime):
@@ -2196,7 +1981,6 @@ async def job_backup(bot: Bot, now: datetime):
 async def scheduler(bot: Bot):
     done: dict[str, date] = {}
     jobs = (
-        ("morning", MORNING_HOUR, job_morning),
         ("evening", REMIND_HOUR, job_evening),
         ("backup", BACKUP_HOUR, job_backup),
     )
@@ -2212,13 +1996,32 @@ async def scheduler(bot: Bot):
         await asyncio.sleep(30)
 
 
+async def warn_if_empty(bot: Bot):
+    """Если база пустая (например, диск не сохранился) — сообщаем админу, как восстановить."""
+    n = db.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+    if n:
+        return
+    for a in ADMINS:
+        try:
+            await bot.send_message(
+                a,
+                "⚠️ <b>База данных пустая.</b>\n"
+                f"Файл: <code>{esc(DB_PATH)}</code>\n\n"
+                "Если это не первый запуск — пришли мне последнюю копию (.db) с подписью "
+                "<code>/restore</code>, и всё вернётся.\n"
+                "Чтобы база больше не пропадала, укажи DB_PATH на постоянный диск.",
+            )
+        except Exception as e:
+            logging.warning("Не удалось предупредить админа %s: %s", a, e)
+
+
 async def main():
-    logging.basicConfig(level=logging.INFO)
     global BOT
     bot = BOT = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await setup_profile(bot)
+    await warn_if_empty(bot)
     asyncio.create_task(scheduler(bot))
     await dp.start_polling(bot)
 
