@@ -87,19 +87,28 @@ def num_emoji(n: int) -> str:
 
 # ---------------------------------------------------------------- база данных
 def _default_db_path() -> str:
-    """Путь к базе. Раньше был относительный 'class.db' — он зависел от папки запуска
-    и терялся при перезапуске/деплое. Теперь: DB_PATH из окружения -> /data (если есть
-    постоянный диск) -> папка с bot.py (всегда один и тот же файл)."""
+    """Путь к базе. Порядок: DB_PATH -> DATA_DIR (Bothost задаёт его сам, это /app/data —
+    единственная папка, которая переживает деплой) -> /app/data -> /data -> папка с bot.py."""
     env = os.getenv("DB_PATH")
     if env:
         return os.path.abspath(env)
-    if os.path.isdir("/data") and os.access("/data", os.W_OK):
-        return "/data/class.db"
+    for d in (os.getenv("DATA_DIR"), "/app/data", "/data"):
+        if d and os.path.isdir(d) and os.access(d, os.W_OK):
+            return os.path.join(d, "class.db")
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "class.db")
 
 
 DB_PATH = _default_db_path()
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+try:  # одна база — один запущенный бот (две копии дерутся за Telegram и пишут в разные данные)
+    import fcntl
+
+    _lock_file = open(DB_PATH + ".lock", "w")
+    fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except ImportError:
+    pass
+except OSError:
+    raise SystemExit("❌ Бот уже запущен с этой базой. Останови старую копию и запусти заново.")
 db = sqlite3.connect(DB_PATH)
 db.row_factory = sqlite3.Row
 db.execute("PRAGMA journal_mode=WAL")
@@ -228,6 +237,17 @@ def parse_day(text: str) -> int | None:
     return None
 
 
+def past_msg(d: date) -> str:
+    return (
+        f"⚠️ Дата {d.strftime('%d.%m')} уже прошла — такая запись сразу скрылась бы из списка.\n"
+        "Напиши дату ещё раз (например: 16.10, завтра, пт)."
+    )
+
+
+def day_label(d: date) -> str:
+    return f"{DAYS_FULL[d.weekday()]}, {d.strftime('%d.%m')}"
+
+
 def next_date(wd: int) -> date:
     """Ближайшая дата (сегодня или позже) с нужным днём недели."""
     return today() + timedelta(days=(wd - today().weekday()) % 7)
@@ -288,7 +308,8 @@ def del_setting(key: str):
 
 
 STUDENT_ROWS = [
-    ["🗓 Расписание", "📌 События"],
+    ["📚 Домашка", "🗓 Расписание"],
+    ["📌 События"],
 ]
 ADMIN_ROWS = [
     ["➕ Добавить ДЗ", "📝 Контрольная"],
@@ -674,9 +695,10 @@ def help_text(uid: int) -> str:
         "<b>🎓 Для всех</b>\n"
         "▫️ <code>расписание</code> · <code>расписание завтра</code> · <code>расписание пт</code> — "
         "уроки и домашка по ним\n"
+        "▫️ <code>домашка</code> — всё домашнее задание\n"
         "▫️ <code>события</code> — контрольные и мероприятия\n"
         "▫️ /me — мой профиль\n"
-        "<i>Расписание и события есть на кнопках внизу. Остальное можно просто написать словами.</i>"
+        "<i>Домашка, расписание и события есть на кнопках внизу. Остальное можно просто написать словами.</i>"
     )
     if role == "helper":
         parts.append(
@@ -693,7 +715,7 @@ def help_text(uid: int) -> str:
         )
         parts.append(
             "<b>📚 Учёба</b>\n"
-            "▫️ /addhw Предмет | Задание | ДД.ММ · /hw — список с номерами · /delhw id\n"
+            "▫️ /addhw Предмет | Задание | ДД.ММ · /hw — список с номерами · /hwold — прошедшее ДЗ · /delhw id\n"
             "▫️ /addtest Алгебра | 15.10 | Тема\n"
             "▫️ /addevent ДД.ММ | Описание · /delevent id\n"
             "▫️ /setweek (по строке на день: «Пн: РОВ, Математика»)\n"
@@ -709,6 +731,7 @@ def help_text(uid: int) -> str:
         parts.append(
             "<b>👥 Люди</b>\n"
             "▫️ /users · /deluser Иванов\n"
+            "▫️ /rename Иванов | Иванов Иван — изменить имя ученика\n"
             "▫️ /addhelper Иванов · /delhelper Иванов · /helpers"
         )
     if role == "owner":
@@ -746,10 +769,8 @@ async def help_cmd(m: Message):
 async def hw(m: Message):
     if not await ensure_member(m):
         return
-    if can_manage(m.from_user.id):  # староста: список ДЗ с номерами для /delhw
-        await m.answer(hw_text(True))
-    else:
-        await m.answer("📚 Домашка теперь в расписании: нажми «🗓 Расписание» или напиши «расписание завтра».")
+    # староста видит номера для /delhw, остальные — просто список
+    await m.answer(hw_text(can_manage(m.from_user.id)))
 
 
 async def send_schedule(m: Message, arg: str):
@@ -783,13 +804,14 @@ async def events(m: Message):
 
 # ---------------------------------------------------------------- меню команд и профиль бота
 BASE_CMDS = [
+    ("hw", "Домашнее задание"),
     ("schedule", "Расписание и ДЗ: сегодня, завтра, день недели"),
     ("events", "События и контрольные"), ("me", "Мой профиль"), ("help", "Помощь"),
 ]
 HELPER_CMDS = [("addhw", "Добавить ДЗ"), ("addtest", "Добавить контрольную"), ("announce", "Отправить объявление")]
 MANAGER_CMDS = [
-    ("hw", "Список ДЗ с номерами"), ("setweek", "Расписание на неделю"), ("replace", "Замена урока"), ("unread", "Кто не прочитал объявление"),
-    ("pollresult", "Итоги опроса"), ("users", "Список учеников"), ("helpers", "Помощники"),
+    ("setweek", "Расписание на неделю"), ("replace", "Замена урока"), ("unread", "Кто не прочитал объявление"),
+    ("pollresult", "Итоги опроса"), ("users", "Список учеников"), ("rename", "Изменить имя ученика"), ("helpers", "Помощники"),
 ]
 OWNER_CMDS = [("backup", "Копия базы данных"), ("setchat", "Подключить общий чат"), ("starostas", "Старосты")]
 
@@ -908,10 +930,29 @@ async def addhw(m: Message, command: CommandObject):
     if not args or not d:
         await m.answer("Формат: /addhw Математика | №123–125 | 12.10 (или «завтра», «пт»)")
         return
+    if d < today():
+        await m.answer(past_msg(d))
+        return
     db.execute("INSERT INTO homework(subject,task,due) VALUES(?,?,?)", (args[0], args[1], d.isoformat()))
     db.commit()
-    await m.answer(f"✅ Домашка добавлена на {d.strftime('%d.%m')}.")
+    await m.answer(f"✅ Домашка добавлена: <b>{esc(args[0])}</b> на {day_label(d)}.")
     await audit(m.from_user, f"➕ <b>Добавил ДЗ</b> на {d.strftime('%d.%m')}\n{esc(args[0])}: {clip(args[1])}")
+
+
+@router.message(Command("hwold"))
+async def hwold(m: Message):
+    """Прошедшее ДЗ (оно не удаляется, просто не показывается в общем списке)."""
+    if not await manager_only(m):
+        return
+    rows = db.execute(
+        "SELECT * FROM homework WHERE due<? ORDER BY due DESC, id DESC LIMIT 20", (today().isoformat(),)
+    ).fetchall()
+    if not rows:
+        await m.answer("Прошедшего ДЗ в базе нет.")
+        return
+    lines = [hdr("🗄", "Прошедшее ДЗ", "последние 20"), ""]
+    lines += [f"▫️ <code>{fmt(r['due'])}</code> <b>{esc(r['subject'])}</b> — {esc(r['task'])} <i>#{r['id']}</i>" for r in rows]
+    await m.answer("\n".join(lines))
 
 
 @router.message(Command("delhw"))
@@ -975,6 +1016,9 @@ async def addtest(m: Message, command: CommandObject):
     d = parse_date(parts[1]) if len(parts) >= 2 else None
     if len(parts) < 2 or not parts[0] or not d:
         await m.answer("Формат: /addtest Алгебра | 15.10 | Квадратные уравнения (тема по желанию)")
+        return
+    if d < today():
+        await m.answer(past_msg(d))
         return
     save_test(parts[0], d, parts[2] if len(parts) > 2 else "")
     await m.answer(f"✅ Контрольная добавлена на {d.strftime('%d.%m')}. Напомню за 3 дня и за 1 день.")
@@ -1552,6 +1596,29 @@ async def users(m: Message):
     )
 
 
+@router.message(Command("rename"))
+async def rename_cmd(m: Message, command: CommandObject):
+    """/rename Иванов | Иванов Иван — старое имя (или id) | новое имя."""
+    if not await manager_only(m):
+        return
+    args = split_args(command, 2)
+    if not args:
+        await m.answer("Формат: /rename Иванов | Иванов Иван\n(слева — текущее имя или id из /users, справа — новое имя)")
+        return
+    new = args[1][:60]
+    if len(new) < 2:
+        await m.answer("Новое имя слишком короткое.")
+        return
+    r = await _pick_user(m, args[0])
+    if not r:
+        return
+    db.execute("UPDATE users SET name=? WHERE id=?", (new, r["id"]))
+    db.execute("UPDATE votes SET name=? WHERE user_id=?", (new, r["id"]))
+    db.commit()
+    await m.answer(f"✏️ Готово: {esc(r['name'])} → <b>{esc(new)}</b>")
+    await audit(m.from_user, f"✏️ <b>Переименовал ученика:</b> {esc(r['name'])} → {esc(new)}")
+
+
 @router.message(Command("deluser"))
 async def deluser(m: Message, command: CommandObject):
     if not await manager_only(m):
@@ -1679,13 +1746,16 @@ async def hw_due(m: Message, state: FSMContext):
     if not d:
         await m.answer("Не понял дату. Примеры: 12.10, завтра, пт.")
         return
+    if d < today():
+        await m.answer(past_msg(d))
+        return
     data = await state.get_data()
     db.execute(
         "INSERT INTO homework(subject,task,due) VALUES(?,?,?)", (data["subject"], data["task"], d.isoformat())
     )
     db.commit()
     await state.clear()
-    await m.answer(f"✅ Добавлено: {esc(data['subject'])} на {d.strftime('%d.%m')}.", reply_markup=kbm(m))
+    await m.answer(f"✅ Добавлено: <b>{esc(data['subject'])}</b> на {day_label(d)}.", reply_markup=kbm(m))
     await audit(m.from_user, f"➕ <b>Добавил ДЗ</b> на {d.strftime('%d.%m')}\n{esc(data['subject'])}: {clip(data['task'])}")
 
 
@@ -1714,6 +1784,9 @@ async def test_due(m: Message, state: FSMContext):
     d = parse_date(m.text)
     if not d:
         await m.answer("Не понял дату. Примеры: 15.10, завтра, пт.")
+        return
+    if d < today():
+        await m.answer(past_msg(d))
         return
     await state.update_data(due=d.isoformat())
     await state.set_state(TestW.topic)
@@ -1942,6 +2015,9 @@ WORDS = {
 }
 
 
+OLD_BUTTONS = {"дежурные", "дни рождения", "завтра"}
+
+
 @router.message(F.text)
 async def words(m: Message):
     if m.chat.type != "private" or m.text.startswith("/"):
@@ -1952,6 +2028,8 @@ async def words(m: Message):
             await send_schedule(m, t[len("расписание"):])
     elif t in WORDS:
         await WORDS[t](m)
+    elif t in OLD_BUTTONS:  # старые кнопки, которые Telegram хранит у пользователя
+        await m.answer("Эта кнопка больше не используется. Клавиатура обновлена 👇", reply_markup=kbm(m))
 
 
 # ---------------------------------------------------------------- фоновые задачи
